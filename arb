@@ -1,0 +1,1150 @@
+#!/usr/bin/env python3
+"""arb - drive the real Chrome on an Android phone from the shell.
+
+Talks to Chrome's DevTools socket through adb. Pages load and render on the
+phone as they do for a person holding it; nothing is emulated.
+
+usage: arb [-s SERIAL] [-t SECONDS] COMMAND ...
+
+reading
+  open URL [--no-dismiss]
+                        load URL in the active tab and wait for it to settle,
+                        waiting out any bot check, accepting any cookie banner
+                        and clearing any app-install promo;
+                        prints status, load ms, final URL, title
+  snap                  outline of the rendered page; controls carry refs (e123)
+  text                  visible text of the page
+  html                  current DOM as HTML
+  eval JS               run JS in the page, print the result
+  shot [-o FILE] [--full | --device]
+                        PNG of the visible page, the whole page, or the whole
+                        phone screen including Chrome's own UI
+
+acting (each waits for any navigation or loading it causes)
+  click REF             tap an element from snap
+  tap X Y               tap at CSS pixel coordinates in the viewport
+  type [REF] TEXT       tap REF if given, then enter TEXT
+  key NAME              Enter, Tab, Backspace, Escape, ArrowUp/Down/Left/Right
+  scroll [up|down] [PX] swipe the page (default: down, most of a screen)
+  back                  go back one page
+
+state
+  dismiss               accept the cookie banner and clear the app-install
+                        promo on the current page
+  tabs                  list tabs: id, url, title (the first is the one arb uses)
+  reset                 clear cookies, cache and site storage; leaves about:blank
+  devices               list phones: serial, model, Android, Chrome
+
+batch
+  capture URL -o DIR [--shot] [--full] [--no-dismiss]
+                        open URL, write meta.json snap.txt text.txt page.html
+                        into DIR, plus shot.png and full.png when asked
+  crawl -o DIR [--shot] [--full] [--no-dismiss] [--keep-state] < urls
+                        capture each URL into DIR/<slug>/, clearing browser
+                        state between sites; skips URLs already captured;
+                        prints status, load ms, url, dir (or error) per URL
+
+The phone is picked with -s, then $ANDROID_SERIAL, then the only one attached.
+-t caps how long a page gets to settle (default 30 seconds).
+"""
+import argparse
+import base64
+import collections
+import fcntl
+import hashlib
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import zlib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+PKG = "com.android.chrome"
+DEVTOOLS = "chrome_devtools_remote"
+CALL_TIMEOUT = 30
+AFTER_LOAD = 5  # seconds to wait for quiet once loaded; ad-heavy pages never get there
+AFTER_DOM = 10  # seconds from DOMContentLoaded to give up on the load event; one stuck ad holds it
+CHALLENGE_WAIT = 20  # seconds to let a bot check clear itself
+CONSENT_WAIT = 15  # seconds to give autoconsent to find and click a cookie banner
+
+
+class Fail(Exception):
+    pass
+
+
+def adb(serial, *args, binary=False):
+    cmd = ["adb"] + (["-s", serial] if serial else []) + list(args)
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode:
+        err = (r.stderr or r.stdout).decode(errors="replace").strip()
+        raise Fail(f"adb {' '.join(args)}: {err}")
+    return r.stdout if binary else r.stdout.decode(errors="replace")
+
+
+def online_serials():
+    rows = adb(None, "devices").splitlines()[1:]
+    return [r.split("\t")[0] for r in rows if r.endswith("\tdevice")]
+
+
+# --- WebSocket: just enough RFC 6455 client for DevTools ---------------------
+
+class WebSocket:
+    def __init__(self, host, port, path):
+        self.sock = socket.create_connection((host, port), timeout=10)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n".encode())
+        self.buf = bytearray()
+        self.parts = []
+        while b"\r\n\r\n" not in self.buf:
+            self._fill()
+        end = self.buf.index(b"\r\n\r\n") + 4
+        status = bytes(self.buf[:end]).split(b"\r\n", 1)[0].decode(errors="replace")
+        if " 101 " not in status:
+            raise Fail(f"DevTools refused the connection: {status}")
+        del self.buf[:end]
+
+    def _fill(self):
+        chunk = self.sock.recv(1 << 20)
+        if not chunk:
+            raise Fail("Chrome closed the DevTools connection")
+        self.buf += chunk
+
+    def send(self, data, opcode=0x1):
+        if isinstance(data, str):
+            data = data.encode()
+        n = len(data)
+        if n < 126:
+            head = struct.pack(">BB", 0x80 | opcode, 0x80 | n)
+        elif n < 65536:
+            head = struct.pack(">BBH", 0x80 | opcode, 0x80 | 126, n)
+        else:
+            head = struct.pack(">BBQ", 0x80 | opcode, 0x80 | 127, n)
+        mask = os.urandom(4)
+        pad = (mask * (n // 4 + 1))[:n]
+        body = (int.from_bytes(data, "big") ^ int.from_bytes(pad, "big")).to_bytes(n, "big")
+        self.sock.sendall(head + mask + body)
+
+    def _frame(self):
+        # Parses from the buffer without consuming a partial frame, so a
+        # timeout in _fill leaves the stream intact.
+        while True:
+            b = self.buf
+            if len(b) >= 2:
+                n, off = b[1] & 0x7F, 2
+                if n == 126:
+                    n, off = (struct.unpack(">H", b[2:4])[0] if len(b) >= 4 else None), 4
+                elif n == 127:
+                    n, off = (struct.unpack(">Q", b[2:10])[0] if len(b) >= 10 else None), 10
+                if n is not None and len(b) >= off + n:
+                    fin, opcode = b[0] & 0x80, b[0] & 0x0F
+                    payload = bytes(b[off:off + n])
+                    del b[:off + n]
+                    return fin, opcode, payload
+            self._fill()
+
+    def recv(self, timeout):
+        """Next complete text message, or None when timeout passes first."""
+        self.sock.settimeout(timeout)
+        try:
+            while True:
+                fin, opcode, payload = self._frame()
+                if opcode == 0x8:
+                    raise Fail("Chrome closed the DevTools connection")
+                if opcode == 0x9:
+                    self.send(payload, 0xA)
+                elif opcode != 0xA:
+                    self.parts.append(payload)
+                    if fin:
+                        msg, self.parts = b"".join(self.parts), []
+                        return msg.decode()
+        except TimeoutError:
+            return None
+
+
+class CDP:
+    def __init__(self, port, target_id):
+        self.ws = WebSocket("127.0.0.1", port, f"/devtools/page/{target_id}")
+        self.last_id = 0
+        self.events = collections.deque()
+
+    def __call__(self, method, **params):
+        self.last_id += 1
+        self.ws.send(json.dumps({"id": self.last_id, "method": method, "params": params}))
+        while True:
+            raw = self.ws.recv(CALL_TIMEOUT)
+            if raw is None:
+                raise Fail(f"{method}: no answer from Chrome in {CALL_TIMEOUT}s")
+            msg = json.loads(raw)
+            if msg.get("id") == self.last_id:
+                if "error" in msg:
+                    raise Fail(f"{method}: {msg['error'].get('message')}")
+                return msg["result"]
+            if "method" in msg:
+                self.events.append(msg)
+
+    def event(self, timeout):
+        if self.events:
+            return self.events.popleft()
+        raw = self.ws.recv(max(timeout, 0.01))
+        msg = json.loads(raw) if raw else None
+        return msg if msg and "method" in msg else None
+
+
+# --- Phone -------------------------------------------------------------------
+
+class Phone:
+    def __init__(self, serial, timeout):
+        self.serial = serial
+        self.timeout = timeout
+        self._port = None
+
+    def shell(self, cmd):
+        return adb(self.serial, "shell", cmd)
+
+    def status(self):
+        out = self.shell(
+            "dumpsys power | grep -m1 mWakefulness=; "
+            "dumpsys window | grep -E 'mCurrentFocus=|mDreamingLockscreen='; "
+            f"grep -c @{DEVTOOLS} /proc/net/unix; true")
+        return {
+            "awake": "mWakefulness=Awake" in out,
+            "locked": "mDreamingLockscreen=true" in out,
+            "front": f" {PKG}/" in out,
+            "listening": out.split()[-1] != "0",
+        }
+
+    def ready(self):
+        """Screen on, unlocked, Chrome in front and accepting DevTools."""
+        s = self.status()
+        if not s["awake"] or s["locked"]:
+            self.shell("input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard")
+            time.sleep(1)
+            s = self.status()
+            if s["locked"]:
+                raise Fail("phone is locked; unlock it by hand")
+        if not (s["front"] and s["listening"]):
+            self.shell(f"am start -W -n {PKG}/com.google.android.apps.chrome.Main")
+            deadline = time.monotonic() + 20
+            while not ((s := self.status())["front"] and s["listening"]):
+                if time.monotonic() > deadline:
+                    raise Fail("Chrome did not come to the front")
+                time.sleep(0.5)
+
+    @property
+    def port(self):
+        if self._port is None:
+            for line in adb(None, "forward", "--list").splitlines():
+                f = line.split()
+                if len(f) == 3 and f[0] == self.serial and f[2] == f"localabstract:{DEVTOOLS}":
+                    self._port = int(f[1].split(":")[1])
+                    break
+            else:
+                self._port = int(adb(self.serial, "forward", "tcp:0", f"localabstract:{DEVTOOLS}"))
+        return self._port
+
+    def http(self, path, method="GET"):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return json.loads(r.read())
+        except OSError as e:
+            raise Fail(f"DevTools HTTP {path}: {e}")
+
+    def pages(self):
+        return [t for t in self.http("/json/list") if t["type"] == "page"]
+
+    def connect(self):
+        self.ready()
+        pages = self.pages() or [self.http("/json/new?about:blank", "PUT")]
+        return CDP(self.port, pages[0]["id"])
+
+    def chrome(self):
+        return self.http("/json/version")["Browser"]
+
+
+def lock(serial, wait):
+    d = ROOT / ".locks"
+    d.mkdir(exist_ok=True)
+    f = open(d / serial, "w")
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except BlockingIOError:
+            if time.monotonic() > deadline:
+                raise Fail(f"{serial} is busy with another arb command")
+            time.sleep(0.2)
+
+
+# --- Page operations ---------------------------------------------------------
+
+def origin(url):
+    u = urllib.parse.urlsplit(url)
+    return f"{u.scheme}://{u.netloc}" if u.scheme in ("http", "https") else None
+
+
+def settle(cdp, start, timeout, navigation=True):
+    """Run start(), then wait for the page to load and go quiet.
+
+    Quiet means at most two requests in flight for a full second, given up
+    AFTER_LOAD seconds after load. With navigation=False (taps, keys, scrolls)
+    no load is expected unless the action starts a new document, and the wait
+    is at least half a second so delayed handlers get to fire.
+    """
+    cdp("Page.enable")
+    cdp("Network.enable")
+    main = cdp("Page.getFrameTree")["frameTree"]["frame"]["id"]
+    t0 = time.monotonic()
+    started = start() or {}
+    if started.get("errorText"):
+        raise Fail(started["errorText"])
+    inflight, origins = set(), set()
+    status, load_ms, quiet, settled, headers = None, None, None, False, None
+    loaded_at = None if navigation else t0
+    dom_at = None
+    while True:
+        ev = cdp.event(0.1)
+        now = time.monotonic()
+        if ev:
+            m, p = ev["method"], ev.get("params", {})
+            if m == "Network.requestWillBeSent":
+                if p.get("type") == "Document" and p.get("frameId") == main:
+                    inflight.clear()  # the previous page's requests will never finish
+                    if not navigation:
+                        loaded_at = None
+                inflight.add(p["requestId"])
+                if o := origin(p["request"]["url"]):
+                    origins.add(o)
+            elif m in ("Network.loadingFinished", "Network.loadingFailed"):
+                inflight.discard(p["requestId"])
+            elif m == "Network.responseReceived" and p.get("type") == "Document" and p.get("frameId") == main:
+                status = p["response"]["status"]
+                headers = p["response"].get("headers") or {}
+            elif m == "Page.loadEventFired" or (
+                    m == "Page.frameNavigated" and p.get("type") == "BackForwardCacheRestore"):
+                loaded_at = now
+                load_ms = round((now - t0) * 1000)
+            elif m == "Page.domContentEventFired":
+                dom_at = now
+            elif m == "Page.javascriptDialogOpening":
+                cdp("Page.handleJavaScriptDialog", accept=True)
+        if len(inflight) > 2:
+            quiet = None
+        elif quiet is None:
+            quiet = now
+        if loaded_at is not None:
+            if quiet is not None and now - quiet >= 1 and now - t0 >= 0.5:
+                settled = True
+                break
+            if now - loaded_at >= AFTER_LOAD:
+                break
+        elif dom_at is not None and now - dom_at >= AFTER_DOM:
+            break
+        if now - t0 > timeout:
+            break
+    return {"status": status, "load_ms": load_ms, "loaded": loaded_at is not None,
+            "quiet": settled, "origins": sorted(origins), "headers": headers}
+
+
+def normalize(url):
+    return url if re.match(r"^[a-z][a-z0-9+.-]*:", url, re.I) else "https://" + url
+
+
+def load(cdp, url, timeout, want_consent=True):
+    r = settle(cdp, lambda: cdp("Page.navigate", url=url), timeout)
+    r["url"], r["title"] = where(cdp)
+    r["challenge"] = clear_challenge(cdp, r)
+    cleared = dismiss(cdp, timeout) if want_consent else {"consent": None, "app": None}
+    r["consent"], r["app_banner"] = cleared["consent"], cleared["app"]
+    if r["consent"] and r["consent"]["clicked"]:
+        # accepting usually starts the ads and trackers the banner was gating
+        settle(cdp, lambda: None, min(timeout, AFTER_LOAD), navigation=False)
+        r["url"], r["title"] = where(cdp)
+    return r
+
+
+def challenge_of(headers, title, url):
+    """Name the bot check holding the page, if any."""
+    h = {k.lower(): v for k, v in (headers or {}).items()}
+    if "challenge" in h.get("cf-mitigated", "").lower():
+        return "cloudflare"
+    if title.strip() in ("Just a moment...", "Attention Required! | Cloudflare",
+                         "Verifying you are human", "Verify you are human"):
+        return "cloudflare"
+    if h.get("x-datadome") or "captcha-delivery.com" in url:
+        return "datadome"
+    if h.get("server", "").startswith("AkamaiGHost") and "sec-cpt" in str(h):
+        return "akamai"
+    return None
+
+
+def clear_challenge(cdp, r):
+    """Wait out a bot check that clears itself, which reloads the real page.
+
+    Checks that need a person (a checkbox, press and hold) are reported, not
+    answered.
+    """
+    vendor = challenge_of(r.get("headers"), r["title"], r["url"])
+    if not vendor:
+        return None
+    deadline = time.monotonic() + CHALLENGE_WAIT
+    while (left := deadline - time.monotonic()) > 0:
+        again = settle(cdp, lambda: None, left)
+        if not again["loaded"]:  # nothing reloaded, so it is waiting on a person
+            break
+        for key in ("status", "load_ms", "quiet", "headers"):
+            if again[key] is not None:
+                r[key] = again[key]
+        r["origins"] = sorted(set(r["origins"]) | set(again["origins"]))
+        r["url"], r["title"] = where(cdp)
+        vendor = challenge_of(r.get("headers"), r["title"], r["url"]) or vendor
+        if not challenge_of(r.get("headers"), r["title"], r["url"]):
+            return {"vendor": vendor, "cleared": True}
+    return {"vendor": vendor, "cleared": False}
+
+
+BANNER_WORDS = r"/cookie|consent|privacy|tracking|gdpr|terms of (use|service)/i"
+BANNER_JS = """(() => {
+  const words = %s;
+  const visible = el => { const s = getComputedStyle(el);
+    if (s.visibility === 'hidden' || s.display === 'none' || s.opacity === '0') return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight; };
+  const overlays = [...document.querySelectorAll('div,section,aside,dialog,[role=dialog],form')]
+    .filter(el => { const s = getComputedStyle(el);
+      if (!(/fixed|sticky/.test(s.position) || el.tagName === 'DIALOG'
+            || el.getAttribute('role') === 'dialog') || !visible(el)) return false;
+      const r = el.getBoundingClientRect();
+      return r.width * r.height >= innerWidth * innerHeight * 0.04 && words.test(el.innerText || ''); });
+  return { overlays, visible };
+})""" % BANNER_WORDS
+
+# Anchored to whole labels, so "Manage cookies" and "Reject all" can't match.
+# Second pass takes a close button, for notices whose only control is an X.
+ACCEPT_JS = r"""(() => {
+  const { overlays, visible } = (%s)();
+  const yes = /^((i )?(agree|accept)( (all|all cookies|cookies|and close|and continue))?|ok|okay|got it|continue|allow all|yes,? i agree|i understand)$/i;
+  const no = /manage|setting|preference|option|reject|decline|more info|learn more|customi|do not|opt.?out|privacy policy|choices/i;
+  const shut = /\b(close|dismiss)\b/i;
+  const label = b => (b.innerText || b.value || b.getAttribute('aria-label')
+    || b.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
+  const hints = b => [b.getAttribute('aria-label'), b.getAttribute('title'), String(b.className),
+    b.id, b.getAttribute('data-testid'), b.querySelector('title')?.textContent].join(' ');
+  for (const pass of [1, 2]) {
+    for (const o of overlays) {
+      for (const b of [...o.querySelectorAll('button,a,[role=button],input[type=submit],input[type=button]')].filter(visible)) {
+        const text = label(b);
+        const hit = pass === 1 ? (text && yes.test(text)) : shut.test(hints(b));
+        if (!hit || no.test(text)) continue;
+        const r = b.getBoundingClientRect();
+        return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2,
+          label: text || 'close', banner: (o.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 80) });
+      }
+    }
+  }
+  return null;
+})()""" % BANNER_JS
+
+SEEN_JS = "(%s)().overlays.length > 0" % BANNER_JS
+
+# "Open app" and "Install" are the traps here: they leave the browser.
+APP_JS = r"""(() => {
+  const visible = el => { const s = getComputedStyle(el);
+    if (s.visibility === 'hidden' || s.display === 'none' || s.opacity === '0') return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight; };
+  const stay = /^(continue (in|to) (browser|web|site|website)|not now|no thanks|maybe later|stay (in|on) (browser|web)|use (the )?(web|browser|site)|skip|later)$/i;
+  const leave = /open|install|get .*app|download|app store|google play|view in app/i;
+  const shut = /\b(close|dismiss|not.?now|no.?thanks)\b/i;
+  const label = b => (b.innerText || b.getAttribute('aria-label')
+    || b.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
+  const hints = b => [b.getAttribute('aria-label'), b.getAttribute('title'), String(b.className),
+    b.id, b.getAttribute('data-testid'), b.querySelector('title')?.textContent].join(' ');
+  // App banners sit in the page flow as often as they float, so match any
+  // small, visible block whose wording is about an app.
+  const promos = [...document.querySelectorAll('div,section,aside,dialog,header,span')]
+    .filter(el => { if (!visible(el)) return false;
+      const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+      if (!/\bapp\b/i.test(t) || t.length > 200) return false;
+      const r = el.getBoundingClientRect();
+      return r.width * r.height > 1000 && r.height < innerHeight * 0.6; })
+    .sort((a, b) => { const p = a.getBoundingClientRect(), q = b.getBoundingClientRect();
+      return p.width * p.height - q.width * q.height; });
+  const controls = 'button,a,[role=button],i,span,svg,[class*=close],[class*=dismiss],[aria-label]';
+  for (const pass of [1, 2]) {
+    for (const o of promos) {
+      for (const b of [...o.querySelectorAll(controls)].filter(visible)) {
+        const text = label(b);
+        if (leave.test(text) || leave.test(String(b.className))) continue;
+        const hit = pass === 1 ? (text && stay.test(text)) : (!text && shut.test(hints(b)));
+        if (!hit) continue;
+        const r = b.getBoundingClientRect();
+        return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2,
+          label: text || 'close', banner: (o.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 80) });
+      }
+    }
+  }
+  // Nothing to click: sites like Reddit ship a bottom sheet with no way out.
+  return promos.length ? JSON.stringify({ banner: (promos[0].innerText || '').replace(/\s+/g, ' ').trim().slice(0, 80) }) : null;
+})()"""
+
+
+def click_away(cdp, finder, timeout):
+    """Tap the control that keeps us on the page, and say what it was."""
+    found = isolated_eval(cdp, finder)
+    if not found:
+        return None
+    hit = json.loads(found)
+    if "x" not in hit:  # a promo with no way out, so report it instead
+        return {"label": None, "banner": hit["banner"], "dismissed": False}
+    settle(cdp, lambda: tap(cdp, hit["x"], hit["y"]), min(timeout, AFTER_LOAD), navigation=False)
+    return {"label": hit["label"], "banner": hit["banner"], "dismissed": True}
+
+
+def dismiss(cdp, timeout):
+    """Clear the cookie banner and any app-install promo covering the page."""
+    return {"consent": consent(cdp, timeout), "app": click_away(cdp, APP_JS, timeout)}
+
+
+def banner_showing(cdp):
+    return bool(isolated_eval(cdp, SEEN_JS))
+
+
+def click_banner(cdp, timeout):
+    """Tap accept on a notice autoconsent has no rule for.
+
+    US sites often roll their own ("Legal Terms and Privacy" on CNN), so this
+    looks for a consent-worded overlay covering part of the screen and taps
+    its accept button, as a finger would.
+    """
+    hit = click_away(cdp, ACCEPT_JS, timeout)
+    return hit and {**hit, "gone": not banner_showing(cdp)}
+
+
+def consent(cdp, timeout=CONSENT_WAIT, action="optIn"):
+    """Accept a cookie banner using autoconsent's rules for known consent tools.
+
+    autoconsent runs in an isolated world, where the page cannot see it, and
+    asks for main-world evaluation through messages this bridges. A page that
+    reloads itself mid-run takes the world with it, so this gets one retry.
+    """
+    for attempt in (1, 2):
+        try:
+            done = run_consent(cdp, timeout, action)
+            break
+        except Fail as e:
+            if attempt == 2 or "context" not in str(e).lower():
+                raise
+            time.sleep(0.5)
+    if not done["clicked"] and banner_showing(cdp):
+        if fallback := click_banner(cdp, timeout):
+            done.update(clicked=fallback["gone"], how="button", label=fallback["label"])
+    return done
+
+
+def run_consent(cdp, timeout, action):
+    frame = cdp("Page.getFrameTree")["frameTree"]["frame"]["id"]
+    world = cdp("Page.createIsolatedWorld", frameId=frame,
+                worldName="arb-consent")["executionContextId"]
+    inner = lambda expr: js_value(cdp("Runtime.evaluate", contextId=world, expression=expr,
+                                      returnByValue=True, awaitPromise=True))
+    reply = lambda msg: inner(f"window.autoconsentReceiveMessage({json.dumps(msg)})")
+    inner("window.arbQueue = []; window.autoconsentSendMessage = m =>"
+          " { window.arbQueue.push(m); return Promise.resolve(); }")
+    inner((ROOT / "vendor" / "autoconsent.js").read_text())
+
+    found = {"cmp": None, "clicked": False, "done": False}
+    started = last = time.monotonic()
+    deadline = started + timeout
+    while time.monotonic() < deadline and not found["done"]:
+        batch = json.loads(inner("(() => { const q = window.arbQueue;"
+                                 " window.arbQueue = []; return JSON.stringify(q) })()") or "[]")
+        last = time.monotonic() if batch else last
+        for m in batch:
+            kind = m.get("type")
+            if kind == "init":
+                reply({"type": "initResp", "config": {
+                    "enabled": True, "autoAction": action, "disabledCmps": [],
+                    "enablePrehide": False, "enableCosmeticRules": False,
+                    "enableGeneratedRules": True, "detectRetries": 20, "isMainWorld": False,
+                    "prehideTimeout": 2000, "enableHeuristicDetection": True,
+                    "enablePopupMutationObserver": True, "visualTest": False,
+                    "performanceLoggingEnabled": False, "heuristicPopupSearchTimeout": 5000,
+                    "heuristicMode": "full",
+                }, "rules": {"autoconsent": [], "compact": json.loads(
+                    (ROOT / "vendor" / "autoconsent-rules.json").read_text())}})
+            elif kind == "eval":  # rule code that needs the page's own world
+                value = js_value(cdp("Runtime.evaluate", expression=m["code"],
+                                     returnByValue=True, awaitPromise=True))
+                reply({"type": "evalResp", "id": m["id"], "result": value})
+            elif kind in ("cmpDetected", "popupFound"):
+                found["cmp"] = m.get("cmp")
+            elif kind in ("optInResult", "optOutResult"):
+                found["clicked"] = bool(m.get("result"))
+            elif kind == "autoconsentDone":
+                found["cmp"], found["done"] = m.get("cmp", found["cmp"]), True
+            elif kind == "report" and m["state"]["lifecycle"] == "nothingDetected":
+                found["done"] = True
+        now = time.monotonic()
+        # autoconsent goes silent when a page has no banner it knows, so stop
+        # once it has had a few seconds and has nothing more to say.
+        if not found["done"] and now - started > 3 and now - last > 2:
+            break
+        if not found["done"]:
+            time.sleep(0.2)
+    return {"cmp": found["cmp"], "clicked": found["clicked"],
+            "how": "autoconsent" if found["clicked"] else None}
+
+
+def where(cdp):
+    h = cdp("Page.getNavigationHistory")
+    e = h["entries"][h["currentIndex"]]
+    return e["url"], e["title"]
+
+
+def isolated_eval(cdp, expr):
+    """Run JS in a separate world: same DOM, invisible to the page's scripts."""
+    frame = cdp("Page.getFrameTree")["frameTree"]["frame"]["id"]
+    ctx = cdp("Page.createIsolatedWorld", frameId=frame, worldName="arb")["executionContextId"]
+    return js_value(cdp("Runtime.evaluate", expression=expr, contextId=ctx,
+                        returnByValue=True, awaitPromise=True))
+
+
+def js_value(r):
+    if "exceptionDetails" in r:
+        d = r["exceptionDetails"]
+        raise Fail((d.get("exception") or {}).get("description") or d.get("text"))
+    return r["result"].get("value")
+
+
+def page_text(cdp):
+    return isolated_eval(cdp, "document.body ? document.body.innerText : ''")
+
+
+def page_html(cdp):
+    return isolated_eval(cdp, "(document.doctype ? new XMLSerializer()"
+                              ".serializeToString(document.doctype) + '\\n' : '')"
+                              " + document.documentElement.outerHTML")
+
+
+def screenshot(cdp, full):
+    if not full:
+        return base64.b64decode(cdp("Page.captureScreenshot", format="png")["data"])
+    # Chrome on Android only paints what is on screen, so captureBeyondViewport
+    # and tall viewport overrides both return the screen repeated. Scroll down
+    # the page instead, clipping each shot to the part not yet captured. Fixed
+    # and sticky elements appear in the first shot only; after that they are
+    # made transparent (keeping their space) so headers and ad bars don't repeat.
+    frame = cdp("Page.getFrameTree")["frameTree"]["frame"]["id"]
+    world = cdp("Page.createIsolatedWorld", frameId=frame, worldName="arb")["executionContextId"]
+    js = lambda expr: cdp("Runtime.evaluate", contextId=world, expression=expr)
+    m = cdp("Page.getLayoutMetrics")
+    start, height = m["cssVisualViewport"]["pageY"], m["cssContentSize"]["height"]
+    tiles, y = [], 0
+    try:
+        while y < height - 1:
+            js(f"window.scrollTo({{top: {y}, behavior: 'instant'}})")
+            if tiles:  # ads swap in new fixed containers while scrolling, so look every time
+                js("window.arbHidden ||= new Map();"
+                   " for (const el of document.querySelectorAll('*'))"
+                   " if (!arbHidden.has(el) && /^(fixed|sticky)$/.test(getComputedStyle(el).position)) {"
+                   " arbHidden.set(el, [el.style.getPropertyValue('opacity'),"
+                   " el.style.getPropertyPriority('opacity')]);"
+                   " el.style.setProperty('opacity', '0', 'important'); }")
+            time.sleep(0.3)  # let the scroll and style changes reach the screen
+            vv = cdp("Page.getLayoutMetrics")["cssVisualViewport"]
+            bottom = min(vv["pageY"] + vv["clientHeight"], height)
+            if bottom - y < 1:
+                break
+            clip = {"x": vv["pageX"], "y": y, "width": vv["clientWidth"], "height": bottom - y, "scale": 1}
+            tiles.append(base64.b64decode(cdp("Page.captureScreenshot", format="png", clip=clip)["data"]))
+            y = bottom
+    finally:
+        js("for (const [el, [value, priority]] of window.arbHidden || []) value ?"
+           " el.style.setProperty('opacity', value, priority) : el.style.removeProperty('opacity');"
+           f" window.arbHidden = null; window.scrollTo({{top: {start}, behavior: 'instant'}})")
+    return stitch(tiles)
+
+
+def png_rows(data):
+    w, h, depth, color, _, _, interlace = struct.unpack(">IIBBBBB", data[16:29])
+    bpp = {2: 3, 6: 4}.get(color)
+    if depth != 8 or interlace or not bpp:
+        raise Fail(f"unexpected PNG from Chrome: depth {depth}, color type {color}")
+    idat, i = bytearray(), 8
+    while i < len(data):
+        n, kind = struct.unpack(">I4s", data[i:i + 8])
+        if kind == b"IDAT":
+            idat += data[i + 8:i + 8 + n]
+        i += 12 + n
+    return w, h, color, bpp, zlib.decompress(idat)
+
+
+def stitch(pngs):
+    """Stack same-width PNGs without decoding their pixels.
+
+    Scanlines stay filtered. Only each tile's first row is rewritten, since
+    its filter was computed against an empty row above it.
+    """
+    out, first = bytearray(), None
+    height = 0
+    for png in pngs:
+        w, h, color, bpp, rows = png_rows(png)
+        first = first or (w, color)
+        if (w, color) != first:
+            raise Fail("page width changed while capturing the full page")
+        stride = w * bpp + 1
+        row = bytearray(rows[:stride])
+        kind, row[0] = row[0], 0
+        if kind in (1, 3, 4):  # Sub, Average, Paeth: with no row above, all reduce to the left pixel
+            for i in range(1 + bpp, stride):
+                left = row[i - bpp]
+                row[i] = (row[i] + (left // 2 if kind == 3 else left)) & 0xFF
+        out += row
+        out += rows[stride:]
+        height += h
+    w, color = first
+    chunk = lambda kind, body: (struct.pack(">I", len(body)) + kind + body
+                                + struct.pack(">I", zlib.crc32(kind + body)))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, height, 8, color, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(out), 6))
+            + chunk(b"IEND", b""))
+
+
+CONTROLS = {
+    "button", "checkbox", "combobox", "link", "listbox", "menuitem", "menuitemcheckbox",
+    "menuitemradio", "option", "radio", "searchbox", "slider", "spinbutton", "switch",
+    "tab", "textbox", "treeitem", "clickable",
+}
+ARIA_ROLES = CONTROLS | {"dialog", "alertdialog", "heading", "navigation", "main", "img", "alert"}
+TAG_ROLES = {
+    "BUTTON": "button", "TEXTAREA": "textbox", "SELECT": "combobox", "NAV": "navigation",
+    "MAIN": "main", "HEADER": "header", "FOOTER": "footer", "FORM": "form", "DIALOG": "dialog",
+    "TABLE": "table", "ARTICLE": "article", "ASIDE": "aside", "IFRAME": "iframe",
+    **{f"H{n}": "heading" for n in range(1, 7)},
+}
+SKIP_TAGS = {"SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "HEAD", "svg"}
+
+
+def snapshot(cdp):
+    """The rendered page as an indented outline, built from the DOM and layout.
+
+    Works from what Chrome actually laid out rather than the accessibility
+    tree, because sites often hide visible content from it (CNN marks its
+    whole page, consent dialog included, aria-hidden).
+    """
+    snap = cdp("DOMSnapshot.captureSnapshot", computedStyles=["visibility"])
+    strings, docs = snap["strings"], snap["documents"]
+    s = lambda i: strings[i] if i >= 0 else ""
+    squash = lambda t: " ".join(t.split())
+    clip = lambda t, n=150: t if len(t) <= n else t[:n - 1] + "…"
+
+    m = cdp("Page.getLayoutMetrics")
+    vv, size = m["cssVisualViewport"], m["cssContentSize"]
+    url, title = where(cdp)
+    lines = [f"# {title}", f"# {url}",
+             f"# viewport {vv['clientWidth']:.0f}x{vv['clientHeight']:.0f}"
+             f" at y={vv['pageY']:.0f} of {size['height']:.0f}"]
+
+    def document(di, depth):
+        d = docs[di]
+        nodes, layout = d["nodes"], d["layout"]
+        base = s(d["documentURL"])
+        names, types, values = nodes["nodeName"], nodes["nodeType"], nodes["nodeValue"]
+        kids = [[] for _ in names]
+        for i, p in enumerate(nodes["parentIndex"]):
+            if p >= 0:
+                kids[p].append(i)
+        rare = lambda k: set((nodes.get(k) or {}).get("index", []))
+        rare_map = lambda k: dict(zip((nodes.get(k) or {}).get("index", []), (nodes.get(k) or {}).get("value", [])))
+        clickable, checked = rare("isClickable"), rare("inputChecked")
+        inputs, frames = rare_map("inputValue"), rare_map("contentDocumentIndex")
+        shown = {n for n, b, st in zip(layout["nodeIndex"], layout["bounds"], layout["styles"])
+                 if b[2] > 0 and b[3] > 0 and b[0] + b[2] > 0 and b[1] + b[3] > 0
+                 and not (st and s(st[0]) == "hidden")}
+        attrs = lambda i: dict(zip(map(s, nodes["attributes"][i][0::2]), map(s, nodes["attributes"][i][1::2])))
+
+        texts = {}
+
+        def text(i, visible=True):
+            if (i, visible) not in texts:
+                tag = s(names[i])
+                if tag == "svg":
+                    t = attrs(i).get("aria-label") or " ".join(
+                        text(k, False) for k in kids[i] if s(names[k]) == "title")
+                elif tag in SKIP_TAGS:
+                    t = ""
+                elif types[i] == 3:
+                    t = s(values[i]) if i in shown or not visible else ""
+                elif tag == "IMG":
+                    t = attrs(i).get("alt", "")
+                else:
+                    t = " ".join(text(k, visible) for k in kids[i])
+                texts[i, visible] = squash(t)
+            return texts[i, visible]
+
+        def role_of(i, tag, a, in_control):
+            aria = a.get("role", "").split(" ")[0]
+            if aria in ARIA_ROLES:
+                return aria
+            if tag == "A" and "href" in a:
+                return "link"
+            if tag == "INPUT":
+                kind = a.get("type", "text").lower()
+                if kind == "hidden":
+                    return None
+                if kind in ("button", "submit", "reset", "image"):
+                    return "button"
+                return kind if kind in ("checkbox", "radio") else "slider" if kind == "range" else "textbox"
+            if tag == "IMG":
+                return "img" if a.get("alt", "").strip() else None
+            if tag in TAG_ROLES:
+                return TAG_ROLES[tag]
+            own_text = any(types[k] == 3 and squash(s(values[k])) for k in kids[i])
+            if (i in clickable and not in_control and tag not in ("HTML", "BODY")
+                    and (own_text or a.get("aria-label")) and len(text(i)) <= 100):
+                return "clickable"
+            return None
+
+        def walk(i, depth, context, in_control):
+            tag = s(names[i])
+            if tag in SKIP_TAGS:
+                return
+            if types[i] == 3:
+                t = squash(s(values[i]))
+                if i in shown and t and t not in context:
+                    lines.append("  " * depth + clip(t, 500))
+                return
+            if types[i] == 1 and i in shown:
+                a = attrs(i)
+                role = role_of(i, tag, a, in_control)
+                if role:
+                    name = a.get("aria-label") or ""
+                    if not name and role == "textbox":
+                        name = a.get("placeholder") or a.get("title") or a.get("name") or ""
+                    if not name and role == "iframe":
+                        name = a.get("title") or urllib.parse.urlsplit(a.get("src", "")).netloc
+                    if not name and role in CONTROLS | {"heading"}:
+                        # screen-reader-only labels are laid out too small to count as shown
+                        name = text(i) or a.get("title") or text(i, visible=False)
+                    if not name and role == "img":
+                        name = a.get("alt", "")
+                    name = squash(name)
+                    parts = [role]
+                    if name:
+                        parts.append(json.dumps(clip(name), ensure_ascii=False))
+                    if role == "heading":
+                        parts.append(f"level={a.get('aria-level') or tag[1:] or 2}")
+                    if role in ("checkbox", "radio", "switch"):
+                        on = i in checked or a.get("aria-checked") == "true"
+                        parts.append(f"checked={str(on).lower()}")
+                    if "aria-expanded" in a:
+                        parts.append(f"expanded={a['aria-expanded']}")
+                    if "disabled" in a or a.get("aria-disabled") == "true":
+                        parts.append("disabled")
+                    if role in ("textbox", "combobox", "slider") and s(inputs.get(i, -1)):
+                        parts.append("value=" + json.dumps(clip(s(inputs[i])), ensure_ascii=False))
+                    if role == "link" and a.get("href"):
+                        parts.append("url=" + urllib.parse.urljoin(base, a["href"]))
+                    if role in CONTROLS:
+                        parts.append(f"[e{nodes['backendNodeId'][i]}]")
+                    lines.append("  " * depth + " ".join(parts))
+                    depth, context = depth + 1, name
+                    in_control = in_control or role in CONTROLS
+            if i in frames:
+                document(frames[i], depth)
+            for k in kids[i]:
+                walk(k, depth, context, in_control)
+
+        for root in (i for i, p in enumerate(nodes["parentIndex"]) if p < 0):
+            walk(root, depth, "", False)
+
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
+    document(0, 0)
+    return "\n".join(lines) + "\n"
+
+
+def element_point(cdp, ref):
+    m = re.fullmatch(r"e(\d+)", ref)
+    if not m:
+        raise Fail(f"not a ref from snap: {ref}")
+    node = int(m.group(1))
+    try:
+        cdp("DOM.scrollIntoViewIfNeeded", backendNodeId=node)
+        quads = cdp("DOM.getContentQuads", backendNodeId=node)["quads"]
+    except Fail:
+        raise Fail(f"{ref} is no longer on the page; run snap again")
+    if not quads:
+        raise Fail(f"{ref} has no visible box")
+    area = lambda q: abs((q[2] - q[0]) * (q[5] - q[3]))
+    q = max(quads, key=area)
+    return sum(q[0::2]) / 4, sum(q[1::2]) / 4
+
+
+def tap(cdp, x, y):
+    cdp("Input.dispatchTouchEvent", type="touchStart", touchPoints=[{"x": x, "y": y}])
+    cdp("Input.dispatchTouchEvent", type="touchEnd", touchPoints=[])
+
+
+KEYS = {
+    "Enter": (13, "\r"), "Tab": (9, None), "Backspace": (8, None), "Escape": (27, None),
+    "ArrowLeft": (37, None), "ArrowUp": (38, None), "ArrowRight": (39, None), "ArrowDown": (40, None),
+}
+
+
+def press(cdp, name):
+    if name not in KEYS:
+        raise Fail(f"unknown key {name}; known: {' '.join(KEYS)}")
+    code, text = KEYS[name]
+    down = {"type": "keyDown", "text": text} if text else {"type": "rawKeyDown"}
+    cdp("Input.dispatchKeyEvent", key=name, code=name, windowsVirtualKeyCode=code, **down)
+    cdp("Input.dispatchKeyEvent", type="keyUp", key=name, code=name, windowsVirtualKeyCode=code)
+
+
+def swipe(cdp, direction, px):
+    vv = cdp("Page.getLayoutMetrics")["cssVisualViewport"]
+    w, h = vv["clientWidth"], vv["clientHeight"]
+    reach = int(h * 0.7)
+    px = px or reach
+    repeats = -(-px // reach)
+    step = px // repeats
+    down = direction == "down"
+    for _ in range(repeats):
+        cdp("Input.synthesizeScrollGesture", x=w / 2, y=h * (0.85 if down else 0.15),
+            yDistance=-step if down else step, gestureSourceType="touch", speed=2000,
+            preventFling=True)
+
+
+def page_origins(cdp):
+    found = isolated_eval(cdp, "[location.href, ...performance.getEntriesByType('resource')"
+                               ".map(e => e.name)]") or []
+    return sorted({o for u in found if (o := origin(u))})
+
+
+def reset(cdp, origins):
+    settle(cdp, lambda: cdp("Page.navigate", url="about:blank"), 10)
+    cdp("Network.clearBrowserCookies")
+    cdp("Network.clearBrowserCache")
+    for o in origins:
+        cdp("Storage.clearDataForOrigin", origin=o, storageTypes="all")
+
+
+def capture(phone, cdp, url, out, shot, full, want_consent=True):
+    out.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+    r = load(cdp, url, phone.timeout, want_consent)
+    if shot:
+        (out / "shot.png").write_bytes(screenshot(cdp, False))
+    (out / "snap.txt").write_text(snapshot(cdp))
+    (out / "text.txt").write_text(page_text(cdp))
+    (out / "page.html").write_text(page_html(cdp))
+    if full:  # last, because it scrolls the page
+        (out / "full.png").write_bytes(screenshot(cdp, True))
+    meta = {"requested": url, **r, "chrome": phone.chrome(), "serial": phone.serial,
+            "captured": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(started))}
+    (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    return r
+
+
+def slug(url):
+    u = urllib.parse.urlsplit(url)
+    base = re.sub(r"[^A-Za-z0-9.-]+", "-", (u.netloc + u.path).strip("/"))[:80].strip("-")
+    return f"{base}-{hashlib.sha1(url.encode()).hexdigest()[:8]}"
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def write_png(data, path):
+    if path:
+        Path(path).write_bytes(data)
+        print(path)
+    elif not sys.stdout.isatty():
+        sys.stdout.buffer.write(data)
+    else:
+        raise Fail("give -o FILE or redirect stdout")
+
+
+def run(a):
+    if a.cmd == "devices":
+        for s in online_serials():
+            p = Phone(s, a.timeout)
+            model = p.shell("getprop ro.product.model").strip()
+            android = p.shell("getprop ro.build.version.release").strip()
+            m = re.search(r"versionName=(\S+)", p.shell(f"dumpsys package {PKG}"))
+            print(f"{s}\t{model}\tAndroid {android}\tChrome {m.group(1) if m else '-'}")
+        return 0
+
+    serial = a.serial or os.environ.get("ANDROID_SERIAL")
+    if not serial:
+        serials = online_serials()
+        if len(serials) != 1:
+            raise Fail("no phone attached" if not serials else
+                       f"several phones attached; pick one with -s: {' '.join(serials)}")
+        serial = serials[0]
+    phone = Phone(serial, a.timeout)
+    held = lock(serial, a.timeout + 30)
+
+    if a.cmd == "crawl":
+        return crawl(phone, Path(a.o), a.keep_state, a.shot, a.full, not a.no_consent)
+
+    if a.cmd == "shot" and a.device:
+        phone.ready()
+        write_png(adb(serial, "exec-out", "screencap -p", binary=True), a.o)
+        return 0
+
+    cdp = phone.connect()
+    if a.cmd == "open":
+        r = load(cdp, normalize(a.url), a.timeout, not a.no_consent)
+        if r["challenge"] and not r["challenge"]["cleared"]:
+            print(f"arb: a {r['challenge']['vendor']} bot check is still showing; it needs a person",
+                  file=sys.stderr)
+        if not r["loaded"]:
+            print("arb: the load event never fired; the page is shown as it was", file=sys.stderr)
+        print(f"{r['status'] or '-'}\t{r['load_ms'] or '-'}\t{r['url']}\t{r['title']}")
+    elif a.cmd == "snap":
+        sys.stdout.write(snapshot(cdp))
+    elif a.cmd == "text":
+        print(page_text(cdp))
+    elif a.cmd == "html":
+        print(page_html(cdp))
+    elif a.cmd == "eval":
+        v = js_value(cdp("Runtime.evaluate", expression=a.js, returnByValue=True, awaitPromise=True))
+        print(v if isinstance(v, str) else json.dumps(v, ensure_ascii=False))
+    elif a.cmd == "shot":
+        write_png(screenshot(cdp, a.full), a.o)
+    elif a.cmd == "click":
+        x, y = element_point(cdp, a.ref)
+        settle(cdp, lambda: tap(cdp, x, y), a.timeout, navigation=False)
+    elif a.cmd == "tap":
+        settle(cdp, lambda: tap(cdp, a.x, a.y), a.timeout, navigation=False)
+    elif a.cmd == "type":
+        if len(a.args) == 2:
+            x, y = element_point(cdp, a.args[0])
+            settle(cdp, lambda: tap(cdp, x, y), a.timeout, navigation=False)
+        elif len(a.args) != 1:
+            raise Fail("usage: arb type [REF] TEXT")
+        settle(cdp, lambda: cdp("Input.insertText", text=a.args[-1]), a.timeout, navigation=False)
+    elif a.cmd == "key":
+        settle(cdp, lambda: press(cdp, a.name), a.timeout, navigation=False)
+    elif a.cmd == "scroll":
+        settle(cdp, lambda: swipe(cdp, a.direction, a.px), a.timeout, navigation=False)
+    elif a.cmd == "back":
+        h = cdp("Page.getNavigationHistory")
+        if h["currentIndex"] == 0:
+            raise Fail("no page to go back to")
+        entry = h["entries"][h["currentIndex"] - 1]["id"]
+        settle(cdp, lambda: cdp("Page.navigateToHistoryEntry", entryId=entry), a.timeout)
+        print("\t".join(where(cdp)))
+    elif a.cmd == "tabs":
+        for t in phone.pages():
+            print(f"{t['id']}\t{t['url']}\t{t['title']}")
+    elif a.cmd == "dismiss":
+        cleared = dismiss(cdp, a.timeout)
+        c = cleared["consent"]
+        print(f"cookies\t{c.get('label') or c['cmp'] or '-'}\t{c['how'] or '-'}"
+              f"\t{'accepted' if c['clicked'] else 'nothing clicked'}")
+        app = cleared["app"]
+        state = ("dismissed" if app and app["dismissed"] else
+                 "found, no way to dismiss" if app else "nothing clicked")
+        print(f"app\t{(app and app['label']) or '-'}\t-\t{state}")
+    elif a.cmd == "reset":
+        reset(cdp, page_origins(cdp))
+    elif a.cmd == "capture":
+        r = capture(phone, cdp, normalize(a.url), Path(a.o), a.shot, a.full, not a.no_consent)
+        print(f"{r['status'] or '-'}\t{r['load_ms'] or '-'}\t{r['url']}\t{a.o}")
+    held.close()
+    return 0
+
+
+def crawl(phone, out, keep_state, shot, full, want_consent=True):
+    failed, origins = False, []
+    for line in sys.stdin:
+        url = line.strip()
+        if not url or url.startswith("#"):
+            continue
+        url = normalize(url)
+        d = out / slug(url)
+        if (d / "meta.json").exists():
+            print(f"skip\t-\t{url}\t{d}", flush=True)
+            continue
+        try:
+            for attempt in (1, 2):  # Chrome sometimes drops the page mid-visit
+                try:
+                    cdp = phone.connect()
+                    if not keep_state:
+                        reset(cdp, origins)
+                    r = capture(phone, cdp, url, d, shot, full, want_consent)
+                    break
+                except Fail as e:
+                    if attempt == 2 or not re.search(r"attached|context|connection", str(e), re.I):
+                        raise
+                    time.sleep(1)
+            origins = r["origins"]
+            print(f"{r['status'] or '-'}\t{r['load_ms'] or '-'}\t{url}\t{d}", flush=True)
+        except (Fail, OSError) as e:
+            failed = True
+            print(f"error\t-\t{url}\t{e}", flush=True)
+    return 1 if failed else 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="arb", usage=argparse.SUPPRESS, description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("-s", dest="serial")
+    p.add_argument("-t", dest="timeout", type=float, default=30)
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+    o = sub.add_parser("open")
+    o.add_argument("url")
+    o.add_argument("--no-dismiss", action="store_true", dest="no_consent")
+    for name in ("snap", "text", "html", "back", "tabs", "reset", "devices", "dismiss"):
+        sub.add_parser(name)
+    sub.add_parser("eval").add_argument("js")
+    shot = sub.add_parser("shot")
+    shot.add_argument("-o")
+    kind = shot.add_mutually_exclusive_group()
+    kind.add_argument("--full", action="store_true")
+    kind.add_argument("--device", action="store_true")
+    sub.add_parser("click").add_argument("ref")
+    t = sub.add_parser("tap")
+    t.add_argument("x", type=float)
+    t.add_argument("y", type=float)
+    sub.add_parser("type").add_argument("args", nargs="+")
+    sub.add_parser("key").add_argument("name")
+    s = sub.add_parser("scroll")
+    s.add_argument("direction", nargs="?", choices=("up", "down"), default="down")
+    s.add_argument("px", nargs="?", type=int)
+    c = sub.add_parser("capture")
+    c.add_argument("url")
+    c.add_argument("-o", required=True)
+    c.add_argument("--shot", action="store_true")
+    c.add_argument("--full", action="store_true")
+    c.add_argument("--no-dismiss", action="store_true", dest="no_consent")
+    c = sub.add_parser("crawl")
+    c.add_argument("-o", required=True)
+    c.add_argument("--shot", action="store_true")
+    c.add_argument("--full", action="store_true")
+    c.add_argument("--no-dismiss", action="store_true", dest="no_consent")
+    c.add_argument("--keep-state", action="store_true")
+    a = p.parse_args()
+    try:
+        sys.exit(run(a))
+    except Fail as e:
+        sys.exit(f"arb: {e}")
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
